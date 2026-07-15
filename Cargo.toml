@@ -1,0 +1,23 @@
+[package]
+name = "wide-hand-eval"
+version = "1.0.0"
+authors = ["Sava Glavan"]
+edition = "2024"
+description = "A CLI Poker Evaluator calculating estimated win equity using Monte Carlo simulations powered by AVX-512 SIMD instructions."
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SavaGlavan/wide-hand-eval"
+keywords = ["poker", "simd", "monte-carlo", "equity", "cli"]
+categories = ["command-line-utilities", "algorithms", "mathematics", "games", "game-development"]
+
+[dependencies]
+rand = "0.10.1"
+rayon = "1.12.0"
+clap = { version = "4.5.54", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "eval_bench"
+harness = false
