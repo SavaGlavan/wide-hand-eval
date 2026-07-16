@@ -26,7 +26,7 @@ You can run the generated binary with specific arguments to set up the poker han
 
 **Example Command:**
 ```bash
-./target/release/cards --player AS AC -b AD TC 9S -o 8C 6C -n 5
+./target/release/wide-hand-eval --player AS AC -b AD TC 9S -o 8C 6C -n 5
 ```
 
 ### Command Line Arguments

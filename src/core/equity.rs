@@ -1,14 +1,15 @@
 use crate::core::card::{Card, RANK_MASK, Rank, Suit};
 use crate::core::hand::Hand;
-use std::simd::u64x16;
+use std::simd::prelude::*;
+use std::simd::{Simd, mask8x64, u8x64, u64x16};
 
-use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use rayon::prelude::*;
-use std::mem::MaybeUninit;
-use std::ptr;
+use std::mem::transmute;
+use simd_rand::portable::*;
 
 const U64_RANDOM_BOTTOM_BIT_INVERSE: u64 = 0xFFFFFFFFFFFFFFFE;
+const CARD_MASK: Simd<u8, 64> = u8x64::splat(0b00111111);
 
 #[inline(always)]
 pub fn hand_arr_to_u64(cards: &[Card; 7]) -> u64 {
@@ -36,17 +37,26 @@ pub fn calculate_equity_unified_mc_avx512(
     let opp_cards_needed = 2 * num_random_opponents;
     let cards_to_draw = board_cards_needed + opp_cards_needed;
 
-    let mut base_rem_deck: Vec<Card> =
-        Vec::with_capacity((52 - used_cards_bitmask.count_ones()) as usize);
     const FULL_DECK: u64 = 0x7FFC_7FFC_7FFC_7FFC;
     let available_cards_bitmask = FULL_DECK & (!used_cards_bitmask);
 
+    // Pre-calculate forbidden splats using the bitmask to avoid allocating in the hot loop
+    let mut forbidden_cards_splats = Vec::with_capacity(64);
+    for i in 0..64 {
+        // If a card is NOT available, add it to the forbidden splat mask
+        if available_cards_bitmask & (1u64 << i) == 0 {
+            forbidden_cards_splats.push(u8x64::splat(i as u8));
+        }
+    }
+
+    // Create a fast lookup table to instantly convert `u8` back to `Card` without `try_from` overhead
+    let mut card_lookup = [hole[0]; 64];
     for count_one in 0..64 {
         if available_cards_bitmask & (1u64 << count_one) != 0 {
-            base_rem_deck.push(Card::new(
+            card_lookup[count_one] = Card::new(
                 Rank::try_from(count_one as u8).unwrap(),
                 Suit::try_from(count_one as u8).unwrap(),
-            ));
+            );
         }
     }
 
@@ -59,43 +69,61 @@ pub fn calculate_equity_unified_mc_avx512(
         .map_init(
             || {
                 // Thread-local state initialization
-                // Prevents heap allocation overhead inside the inner Monte Carlo loop
-                let rng: SmallRng = rand::make_rng();
-                let local_deck = base_rem_deck.clone();
+                // Seeds the high-performance SIMD RNG directly from the thread RNG
+                let rng = Xoshiro256PlusPlusX8::from_rng(&mut rand::rng());
                 let hands_buffer = vec![0u64; 16 * (1 + num_opponents)];
                 let scores_buffer = vec![0u32; 16 * (1 + num_opponents)];
-                (rng, local_deck, hands_buffer, scores_buffer)
+                (rng, hands_buffer, scores_buffer)
             },
-            |(rng, rem_deck, hands, scores), _batch_idx| {
+            |(rng, hands, scores), _batch_idx| {
                 let mut local_equity = 0.0;
                 let local_games = 16;
                 let mut counter = 0;
 
                 // 1. GENERATION STAGE
                 for _ in 0..16 {
-                    // NATIVE PARTIAL SHUFFLE
-                    // Shuffles exactly `cards_to_draw` elements uniformly at random and
-                    // moves them to the front of the `rem_deck` slice.
-                    let _ = rem_deck.partial_shuffle(rng, cards_to_draw);
+                    let mut drawn_cards = [0u8; 64];
+                    let mut current_len = 0;
+                    let mut drawn_cards_mask = 0u64; // Prevents intra-vector duplicates
 
-                    let completed_board: [Card; 5] = unsafe {
-                        let mut arr = MaybeUninit::<[Card; 5]>::uninit();
-                        let ptr = arr.as_mut_ptr() as *mut Card;
-                        let board_len = board.len();
+                    // SIMD RANDOM CARD GENERATION
+                    while current_len < cards_to_draw {
+                        let mut vector: u8x64 = unsafe { transmute(rng.next_u64x8()) };
+                        vector &= CARD_MASK;
 
-                        if board_len > 0 {
-                            ptr::copy_nonoverlapping(board.as_ptr(), ptr, board_len);
+                        // Apply forbidden masks
+                        for card in forbidden_cards_splats.iter() {
+                            let repeat_catch_check: mask8x64 = vector.simd_eq(*card);
+                            vector = repeat_catch_check.select(u8x64::splat(0), vector);
                         }
 
-                        // This remains perfectly safe because `partial_shuffle` leaves
-                        // the drawn cards neatly packed at the beginning of `rem_deck`.
-                        ptr::copy_nonoverlapping(
-                            rem_deck.as_ptr(),
-                            ptr.add(board_len),
-                            board_cards_needed,
-                        );
-                        arr.assume_init()
-                    };
+                        let mut bitmask = vector.simd_ne(u8x64::splat(0)).to_bitmask();
+                        let array = vector.to_array();
+
+                        while bitmask != 0 && current_len < cards_to_draw {
+                            let index = bitmask.trailing_zeros(); // Hardware tzcnt
+                            let card_val = array[index as usize];
+
+                            // Ensure we haven't already drawn this card in this specific game
+                            if (drawn_cards_mask & (1u64 << card_val)) == 0 {
+                                drawn_cards_mask |= 1u64 << card_val;
+                                drawn_cards[current_len] = card_val;
+                                current_len += 1;
+                            }
+
+                            bitmask &= bitmask - 1; // Clear lowest set bit
+                        }
+                    }
+
+                    // Pack the completed board (Replaces the unsafe MaybeUninit block)
+                    let mut completed_board = [hole[0]; 5];
+                    let board_len = board.len();
+                    if board_len > 0 {
+                        completed_board[..board_len].copy_from_slice(board);
+                    }
+                    for i in 0..board_cards_needed {
+                        completed_board[board_len + i] = card_lookup[drawn_cards[i] as usize];
+                    }
 
                     // Pack Hero's Hand
                     hands[counter] = hand_arr_to_u64(&[
@@ -131,16 +159,14 @@ pub fn calculate_equity_unified_mc_avx512(
                             completed_board[2],
                             completed_board[3],
                             completed_board[4],
-                            rem_deck[board_cards_needed + 2 * j],
-                            rem_deck[board_cards_needed + 2 * j + 1],
+                            card_lookup[drawn_cards[board_cards_needed + 2 * j] as usize],
+                            card_lookup[drawn_cards[board_cards_needed + 2 * j + 1] as usize],
                         ]);
                     }
                     counter += 1;
                 }
 
                 // 2. SIMD EVALUATION STAGE
-                // Extract into chunks of exactly 8. This guarantees no remainder and
-                // tells LLVM it can unroll and vectorize without bounds checks.
                 let mut out_idx = 0;
                 for chunk in hands.chunks_exact(16) {
                     let in_buffer: [u64; 16] = chunk.try_into().unwrap();

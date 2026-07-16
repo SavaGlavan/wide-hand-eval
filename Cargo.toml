@@ -11,9 +11,10 @@ keywords = ["poker", "simd", "monte-carlo", "equity", "cli"]
 categories = ["command-line-utilities", "algorithms", "mathematics", "games", "game-development"]
 
 [dependencies]
-rand = "0.10.1"
+rand = "0.9.5"
 rayon = "1.12.0"
 clap = { version = "4.5.54", features = ["derive"] }
+simd_rand = { version = "0.1", features = ["portable"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
